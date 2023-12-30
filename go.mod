@@ -1,6 +1,5 @@
 module github.com/ybrs/pgduckdb
 
-
 go 1.21
 
 require (

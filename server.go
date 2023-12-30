@@ -90,7 +90,6 @@ func toRowDescription(cols []*sql.ColumnType) *pgproto3.RowDescription {
 	var desc pgproto3.RowDescription
 
 	for _, col := range cols {
-		fmt.Println(">>> type name", col.DatabaseTypeName())
 		desc.Fields = append(desc.Fields, pgproto3.FieldDescription{
 			Name:                 []byte(col.Name()),
 			TableOID:             0,
