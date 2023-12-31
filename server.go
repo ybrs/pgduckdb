@@ -10,6 +10,12 @@ import (
 	_ "github.com/marcboeker/go-duckdb"
 	"io"
 	"net"
+	"strings"
+)
+
+// Postgres settings.
+const (
+	ServerVersion = "13.0.0"
 )
 
 type DuckDbBackend struct {
@@ -110,7 +116,7 @@ func scanRow(rows *sql.Rows, cols []*sql.ColumnType) (*pgproto3.DataRow, error) 
 		refs[i] = &values[i]
 	}
 
-	// Scan from SQLite database.
+	// Scan from Duckdb database.
 	if err := rows.Scan(refs...); err != nil {
 		return nil, fmt.Errorf("scan: %w", err)
 	}
@@ -121,6 +127,76 @@ func scanRow(rows *sql.Rows, cols []*sql.ColumnType) (*pgproto3.DataRow, error) 
 		row.Values[i] = []byte(fmt.Sprint(values[i]))
 	}
 	return &row, nil
+}
+
+func (p *DuckDbBackend) HandleQuery(query string) error {
+	_, err := p.db.Prepare(query)
+	if err != nil {
+		fmt.Println("coulnt handle query", query)
+		writeMessages(p.conn,
+			&pgproto3.ErrorResponse{Message: err.Error()},
+			&pgproto3.ReadyForQuery{TxStatus: 'I'},
+		)
+		return nil
+	}
+
+	rows, err := p.db.QueryContext(p.ctx, query)
+	if err != nil {
+		fmt.Println("couldnt handle query 2", query)
+		writeMessages(p.conn,
+			&pgproto3.ErrorResponse{Message: err.Error()},
+			&pgproto3.ReadyForQuery{TxStatus: 'I'},
+		)
+		return nil
+	}
+	defer rows.Close()
+
+	cols, err := rows.ColumnTypes()
+	if err != nil {
+		return fmt.Errorf("column types: %w", err)
+	}
+	buf := toRowDescription(cols).Encode(nil)
+
+	// Iterate over each row and encode it to the wire protocol.
+	for rows.Next() {
+		row, err := scanRow(rows, cols)
+		if err != nil {
+			return fmt.Errorf("scan: %w", err)
+		}
+		buf = row.Encode(buf)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("rows: %w", err)
+	}
+	buf = (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(buf)
+	buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+	_, err = p.conn.Write(buf)
+	//fmt.Println("sending buf", buf)
+	if err != nil {
+		return fmt.Errorf("error writing query response: %w", err)
+	}
+
+	return nil
+}
+
+// CREATE OR REPLACE FUNCTION _pg_expandarray(anyarray) AS (SELECT [unnest(anyarray), generate_subscripts(anyarray, 1)]);
+// CREATE OR REPLACE FUNCTION array_upper(anyarray, f) AS len(anyarray) + 1;
+func rewriteQuery(query string) string {
+	// poor mans attempt to pass parse commands
+	// make pycharm/goland/jetbrains ide database tool work
+	// ideally we should use something like https://pkg.go.dev/github.com/dallen66/pg_query_go/v2#section-readme
+	// to properly map things (or have a pgcatalog database??)
+	query = strings.ReplaceAll(query, "pgcatalog.current_database(", "current_database(")
+	query = strings.ReplaceAll(query, "pg_catalog.current_schema(", "current_schema(")
+	query = strings.ReplaceAll(query, "pg_catalog.", "")
+	query = strings.ReplaceAll(query, "::regclass", "::oid")
+	query = strings.ReplaceAll(query, "SHOW TRANSACTION ISOLATION LEVEL", "select 'read committed'")
+	query = strings.ReplaceAll(query, ` trim(both '"' from pg_get_indexdef(tmp.CI_OID, tmp.ORDINAL_POSITION, false)) `, `'' `)
+	query = strings.ReplaceAll(query, `(information_schema._pg_expandarray(i.indkey)).n `, `1`)
+	query = strings.ReplaceAll(query, `information_schema._pg_expandarray(`, `_pg_expandarray( `)
+	query = strings.ReplaceAll(query, ` (result.KEYS).x `, ` result.KEYS[0] `)
+	query = strings.ReplaceAll(query, `::regproc`, ``)
+	return query
 }
 
 func (p *DuckDbBackend) Run() error {
@@ -139,54 +215,68 @@ func (p *DuckDbBackend) Run() error {
 
 		switch msg.(type) {
 		case *pgproto3.Query:
-			fmt.Println("msg", msg)
+			//fmt.Println("msg", msg)
 			query := msg.(*pgproto3.Query)
-
-			_, err = p.db.Prepare(query.String)
-			if err != nil {
-				writeMessages(p.conn,
-					&pgproto3.ErrorResponse{Message: err.Error()},
-					&pgproto3.ReadyForQuery{TxStatus: 'I'},
-				)
-				continue
-			}
-
-			rows, err := p.db.QueryContext(p.ctx, query.String)
-			if err != nil {
-				writeMessages(p.conn,
-					&pgproto3.ErrorResponse{Message: err.Error()},
-					&pgproto3.ReadyForQuery{TxStatus: 'I'},
-				)
-				continue
-			}
-			defer rows.Close()
-
-			cols, err := rows.ColumnTypes()
-			if err != nil {
-				return fmt.Errorf("column types: %w", err)
-			}
-			buf := toRowDescription(cols).Encode(nil)
-
-			// Iterate over each row and encode it to the wire protocol.
-			for rows.Next() {
-				row, err := scanRow(rows, cols)
-				if err != nil {
-					return fmt.Errorf("scan: %w", err)
-				}
-				buf = row.Encode(buf)
-			}
-			if err := rows.Err(); err != nil {
-				return fmt.Errorf("rows: %w", err)
-			}
-			buf = (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(buf)
-			buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
-			_, err = p.conn.Write(buf)
-			if err != nil {
-				return fmt.Errorf("error writing query response: %w", err)
-			}
+			p.HandleQuery(query.String)
 		case *pgproto3.Terminate:
 			return nil
+
+		case *pgproto3.Parse:
+			// For now we simply ignore parse messages
+			// https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY
+			q := msg.(*pgproto3.Parse)
+			//fmt.Println("parse >>>", q)
+			query := q.Query
+			if strings.HasPrefix(q.Query, "SET ") ||
+				strings.Contains(q.Query, "proargmodes") ||
+				strings.Contains(q.Query, "prokind") ||
+				strings.Contains(q.Query, "from pg_catalog.pg_locks") {
+				//fmt.Println("skipped query returning ok")
+				buf := (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(nil)
+				buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+				//fmt.Println("parse complete write buf")
+				_, err = p.conn.Write(buf)
+				if err != nil {
+					return fmt.Errorf("error writing query response: %w", err)
+				}
+				continue
+
+			}
+			//fmt.Println("run parse query", query)
+			if query == "" {
+				buf := (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(nil)
+				buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+				buf = (&pgproto3.ParseComplete{}).Encode(buf)
+				//fmt.Println("parse complete write buf")
+				_, err = p.conn.Write(buf)
+				if err != nil {
+					return fmt.Errorf("error writing query response: %w", err)
+				}
+
+				continue
+			}
+
+			query = rewriteQuery(query)
+			//fmt.Println("running rewritten >", query)
+			p.HandleQuery(query)
+			//buf := (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(nil)
+			//buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+			//fmt.Println("parse complete write buf")
+			//_, err = p.conn.Write(buf)
+			//if err != nil {
+			//	return fmt.Errorf("error writing query response: %w", err)
+			//}
+
+		case *pgproto3.Bind:
+			continue
+		case *pgproto3.Execute:
+			continue
+		case *pgproto3.Sync:
+			continue
+		case *pgproto3.Describe:
+			continue
 		default:
+			print("coming to default ??", msg)
 			return fmt.Errorf("received message other than Query from client: %#v", msg)
 		}
 	}
@@ -201,6 +291,7 @@ func (p *DuckDbBackend) handleStartup() error {
 	switch startupMessage.(type) {
 	case *pgproto3.StartupMessage:
 		buf := (&pgproto3.AuthenticationOk{}).Encode(nil)
+		buf = (&pgproto3.ParameterStatus{Name: "server_version", Value: ServerVersion}).Encode(buf)
 		buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
 		_, err = p.conn.Write(buf)
 		if err != nil {

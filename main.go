@@ -51,6 +51,8 @@ func main() {
 		bootQueries := []string{
 			"INSTALL 'json'",
 			"LOAD 'json'",
+			"INSTALL 'icu'",
+			"LOAD 'icu'",
 		}
 
 		for _, qry := range bootQueries {
