@@ -15,7 +15,7 @@ import (
 
 // Postgres settings.
 const (
-	ServerVersion = "13.0.0"
+	ServerVersion = "16.0.0"
 )
 
 type DuckDbBackend struct {
@@ -200,11 +200,29 @@ func rewriteQuery(query string) string {
 }
 
 func (p *DuckDbBackend) Run() error {
+	var binds []interface{}
+	var rows *sql.Rows
+	var cols []*sql.ColumnType
+	var query string
+
 	defer p.Close()
 
 	err := p.handleStartup()
 	if err != nil {
 		return err
+	}
+
+	exec := func(stmt *sql.Stmt) (err error) {
+		if rows != nil {
+			return nil
+		}
+		if rows, err = stmt.QueryContext(p.ctx, binds...); err != nil {
+			return fmt.Errorf("query: %w", err)
+		}
+		if cols, err = rows.ColumnTypes(); err != nil {
+			return fmt.Errorf("column types: %w", err)
+		}
+		return nil
 	}
 
 	for {
@@ -213,53 +231,77 @@ func (p *DuckDbBackend) Run() error {
 			return fmt.Errorf("error receiving message: %w", err)
 		}
 
+		fmt.Println("msg >>>", msg)
+
 		switch msg.(type) {
 		case *pgproto3.Query:
-			//fmt.Println("msg", msg)
-			query := msg.(*pgproto3.Query)
-			p.HandleQuery(query.String)
+			fmt.Println(">>> query")
+			q := msg.(*pgproto3.Query)
+			if strings.HasPrefix(q.String, "SET ") {
+				// for now simply ignore SET params
+				buf := (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(nil)
+				buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+				_, err = p.conn.Write(buf)
+				if err != nil {
+					return fmt.Errorf("error writing query response: %w", err)
+				}
+				continue
+			}
+			fmt.Println("handling query ", q)
+			p.HandleQuery(q.String)
 		case *pgproto3.Terminate:
 			return nil
 
 		case *pgproto3.Parse:
-			// For now we simply ignore parse messages
 			// https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY
 			q := msg.(*pgproto3.Parse)
-			//fmt.Println("parse >>>", q)
-			query := q.Query
-			if strings.HasPrefix(q.Query, "SET ") ||
-				strings.Contains(q.Query, "proargmodes") ||
-				strings.Contains(q.Query, "prokind") ||
-				strings.Contains(q.Query, "from pg_catalog.pg_locks") {
-				//fmt.Println("skipped query returning ok")
-				buf := (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(nil)
-				buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
-				//fmt.Println("parse complete write buf")
-				_, err = p.conn.Write(buf)
-				if err != nil {
-					return fmt.Errorf("error writing query response: %w", err)
-				}
-				continue
+			fmt.Println("parse >>>", q)
+			query = q.Query
 
+			_, err := p.db.Prepare(query)
+			if err != nil {
+				fmt.Println("coulnt handle query - parse error", query, "err:", err.Error())
+				writeMessages(p.conn,
+					&pgproto3.ErrorResponse{Message: err.Error()},
+					&pgproto3.ReadyForQuery{TxStatus: 'I'},
+				)
+				continue
 			}
+
+			//if strings.HasPrefix(q.Query, "SET ") ||
+			//	strings.Contains(q.Query, "proargmodes") ||
+			//	strings.Contains(q.Query, "prokind") ||
+			//	strings.Contains(q.Query, "from pg_catalog.pg_locks") {
+			//	//fmt.Println("skipped query returning ok")
+			//	buf := (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(nil)
+			//	buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+			//	//fmt.Println("parse complete write buf")
+			//	_, err = p.conn.Write(buf)
+			//	if err != nil {
+			//		return fmt.Errorf("error writing query response: %w", err)
+			//	}
+			//	continue
+			//
+			//}
 			//fmt.Println("run parse query", query)
-			if query == "" {
-				buf := (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(nil)
-				buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
-				buf = (&pgproto3.ParseComplete{}).Encode(buf)
-				//fmt.Println("parse complete write buf")
-				_, err = p.conn.Write(buf)
-				if err != nil {
-					return fmt.Errorf("error writing query response: %w", err)
-				}
+			//if query == "" {
+			//	buf := (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(nil)
+			//	buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+			//	buf = (&pgproto3.ParseComplete{}).Encode(buf)
+			//	//fmt.Println("parse complete write buf")
+			//	_, err = p.conn.Write(buf)
+			//	if err != nil {
+			//		return fmt.Errorf("error writing query response: %w", err)
+			//	}
+			//
+			//	continue
+			//}
 
-				continue
-			}
-
-			query = rewriteQuery(query)
+			//query = rewriteQuery(query)
 			//fmt.Println("running rewritten >", query)
-			p.HandleQuery(query)
+			//p.HandleQuery(query)
 			//buf := (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(nil)
+			//buf = (&pgproto3.ParseComplete{}).Encode(buf)
 			//buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
 			//fmt.Println("parse complete write buf")
 			//_, err = p.conn.Write(buf)
@@ -268,12 +310,74 @@ func (p *DuckDbBackend) Run() error {
 			//}
 
 		case *pgproto3.Bind:
+			msg := msg.(*pgproto3.Bind)
+			fmt.Println("bind ", msg.PreparedStatement, msg.Parameters)
+
+			binds = make([]interface{}, len(msg.Parameters))
+			for i := range msg.Parameters {
+				binds[i] = string(msg.Parameters[i])
+			}
+			buf := (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(nil)
+			buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+			_, err = p.conn.Write(buf)
+			if err != nil {
+				fmt.Println("error on execute", err)
+			}
 			continue
 		case *pgproto3.Execute:
+			msg := msg.(*pgproto3.Execute)
+
+			fmt.Println("Execute ", msg, "portal", msg.Portal)
+
+			if strings.HasPrefix(query, "SET ") {
+				// for now simply ignore SET params
+				buf := (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(nil)
+				buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+				continue
+			}
+
+			stmt, err := p.db.PrepareContext(p.ctx, query)
+
+			if err := exec(stmt); err != nil {
+				return fmt.Errorf("exec: %w", err)
+			}
+
+			var buf []byte
+			for rows.Next() {
+				row, err := scanRow(rows, cols)
+				if err != nil {
+					return fmt.Errorf("scan: %w", err)
+				}
+				buf = row.Encode(buf)
+			}
+			if err := rows.Err(); err != nil {
+				return fmt.Errorf("rows: %w", err)
+			}
+
+			// Mark command complete and ready for next query.
+			buf = (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(buf)
+			buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+			_, err = p.conn.Write(buf)
+			if err != nil {
+				fmt.Println("error on execute", err)
+			}
 			continue
 		case *pgproto3.Sync:
 			continue
 		case *pgproto3.Describe:
+			fmt.Println("describe ", msg)
+
+			stmt, err := p.db.PrepareContext(p.ctx, query)
+			if err != nil {
+				fmt.Println()
+			}
+
+			if err := exec(stmt); err != nil {
+				fmt.Errorf("exec: %w", err)
+			}
+			if _, err := p.conn.Write(toRowDescription(cols).Encode(nil)); err != nil {
+				fmt.Println("conn write", err)
+			}
 			continue
 		default:
 			print("coming to default ??", msg)
@@ -292,6 +396,8 @@ func (p *DuckDbBackend) handleStartup() error {
 	case *pgproto3.StartupMessage:
 		buf := (&pgproto3.AuthenticationOk{}).Encode(nil)
 		buf = (&pgproto3.ParameterStatus{Name: "server_version", Value: ServerVersion}).Encode(buf)
+		buf = (&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"}).Encode(buf)
+
 		buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
 		_, err = p.conn.Write(buf)
 		if err != nil {
